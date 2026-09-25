@@ -1706,3 +1706,209 @@ def test_annotation_migrate_index_wrong_type(client):
                          "end_index": 1}]})
     assert r.status_code == 422
     assert "整数" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# 敏感词脱敏 POST /redact
+# ---------------------------------------------------------------------------
+def _redact(client, items, revised, terms, padding_ms=0, total=1000):
+    payload = {
+        "recognized": rc(items),
+        "total_duration": total,
+        "revised_text": revised,
+        "terms": terms,
+        "padding_ms": padding_ms,
+    }
+    return client.post("/redact", json=payload)
+
+
+def test_redact_basic_masking_and_mute_intervals(client):
+    r = _redact(client, [
+        ("张", 0, 100), ("三", 100, 200), ("说", 200, 300),
+        ("李", 300, 400), ("四", 400, 500), ("来", 500, 600),
+        ("了", 600, 700),
+    ], "张三说李四来了", ["张三", "李四"], padding_ms=30)
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "redacted_text": "██说██来了",
+        "spans": [
+            {"start_index": 0, "end_index": 2, "text": "张三",
+             "start": 0, "end": 200},
+            {"start_index": 3, "end_index": 5, "text": "李四",
+             "start": 300, "end": 500},
+        ],
+        # [0,200] 扩 30 → [0,230]（起点裁剪到 0）；[300,500] 扩 30 → [270,530]
+        "mute_intervals": [
+            {"start": 0, "end": 230},
+            {"start": 270, "end": 530},
+        ],
+    }
+
+
+def test_redact_overlapping_occurrences_merge(client):
+    # “aa”在“aaa”中的两个重叠命中 (0,2)、(1,3) 合并为 (0,3)
+    r = _redact(client, [
+        ("a", 0, 100), ("a", 100, 200), ("a", 200, 300),
+    ], "aaa", ["aa"], total=400)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["redacted_text"] == "███"
+    assert body["spans"] == [
+        {"start_index": 0, "end_index": 3, "text": "aaa",
+         "start": 0, "end": 300}]
+    assert body["mute_intervals"] == [{"start": 0, "end": 300}]
+
+
+def test_redact_touching_hits_merge_into_one_span(client):
+    # “ab”(0,2) 与 “cd”(2,4) 端点相接 → 合并为 (0,4)
+    r = _redact(client, [
+        ("a", 0, 100), ("b", 100, 200), ("c", 200, 300), ("d", 300, 400),
+    ], "abcd", ["ab", "cd"], total=500)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["redacted_text"] == "████"
+    assert body["spans"] == [
+        {"start_index": 0, "end_index": 4, "text": "abcd",
+         "start": 0, "end": 400}]
+
+
+def test_redact_mask_length_equals_original(client):
+    r = _redact(client, [
+        ("机", 0, 100), ("密", 100, 200), ("词", 200, 300),
+    ], "机密词", ["机密词"], total=400)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body["redacted_text"]) == len("机密词")
+    assert set(body["redacted_text"]) == {"█"}
+
+
+def test_redact_no_hit_returns_original_and_empty(client):
+    r = _redact(client, [("你", 0, 100), ("好", 200, 300)], "你好",
+                ["机密"], padding_ms=100, total=400)
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "redacted_text": "你好", "spans": [], "mute_intervals": []}
+
+
+def test_redact_empty_revised_text(client):
+    r = _redact(client, [("a", 0, 100)], "", ["a"], total=200)
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "redacted_text": "", "spans": [], "mute_intervals": []}
+
+
+def test_redact_padding_clamped_to_recording_bounds(client):
+    # 命中区间 [100,300] 扩 1000：两侧分别裁剪到 0 与 total_duration
+    r = _redact(client, [
+        ("你", 0, 100), ("机", 100, 200), ("密", 200, 300),
+    ], "你机密", ["机密"], padding_ms=1000, total=300)
+    assert r.status_code == 200, r.text
+    assert r.json()["mute_intervals"] == [{"start": 0, "end": 300}]
+
+
+def test_redact_mute_intervals_merge_when_padding_bridges_gap(client):
+    # [0,200] 扩 100 → [0,300]；[300,500] 扩 100 → [200,500]，重叠合并
+    r = _redact(client, [
+        ("张", 0, 100), ("三", 100, 200), ("说", 200, 300),
+        ("李", 300, 400), ("四", 400, 500),
+    ], "张三说李四", ["张三", "李四"], padding_ms=100, total=500)
+    assert r.status_code == 200, r.text
+    assert r.json()["mute_intervals"] == [{"start": 0, "end": 500}]
+
+
+def test_redact_touching_mute_intervals_merge(client):
+    # [0,200] 扩 50 → [0,250]；[300,500] 扩 50 → [250,500]，端点相接也合并
+    r = _redact(client, [
+        ("张", 0, 100), ("三", 100, 200), ("说", 200, 300),
+        ("李", 300, 400), ("四", 400, 500),
+    ], "张三说李四", ["张三", "李四"], padding_ms=50, total=500)
+    assert r.status_code == 200, r.text
+    assert r.json()["mute_intervals"] == [{"start": 0, "end": 500}]
+
+
+def test_redact_uses_computed_timeline_for_inserted_chars(client):
+    # 新增字符“要”在空档 [100,900] 内推算，区间时间以其推算时间为准
+    r = _redact(client, [("机", 0, 100), ("密", 900, 1000)], "机要密",
+                ["机要密"], padding_ms=10)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["redacted_text"] == "███"
+    assert body["spans"] == [
+        {"start_index": 0, "end_index": 3, "text": "机要密",
+         "start": 0, "end": 1000}]
+    assert body["mute_intervals"] == [{"start": 0, "end": 1000}]
+
+
+def test_redact_zero_padding_keeps_original_times(client):
+    r = _redact(client, [
+        ("机", 100, 200), ("密", 300, 400),
+    ], "机密", ["机密"], padding_ms=0, total=500)
+    assert r.status_code == 200, r.text
+    assert r.json()["mute_intervals"] == [{"start": 100, "end": 400}]
+
+
+def test_redact_reuses_alignment_validation(client):
+    r = _redact(client, [("a", 300, 100)], "a", ["a"], total=500)
+    assert r.status_code == 422
+    assert "结束时间" in r.json()["detail"]
+
+
+def test_redact_duplicate_terms_rejected(client):
+    r = _redact(client, [], "", ["机密", "秘密", "机密"], total=0)
+    assert r.status_code == 422
+    assert "互不相同" in r.json()["detail"]
+
+
+def test_redact_empty_term_rejected(client):
+    r = _redact(client, [], "", ["机密", ""], total=0)
+    assert r.status_code == 422
+    assert "非空" in r.json()["detail"]
+
+
+def test_redact_terms_count_range(client):
+    r0 = _redact(client, [], "", [], total=0)
+    assert r0.status_code == 422
+    assert "1～50" in r0.json()["detail"]
+    r51 = _redact(client, [], "", [f"词{i}" for i in range(51)], total=0)
+    assert r51.status_code == 422
+    assert "1～50" in r51.json()["detail"]
+    ok = _redact(client, [], "", [f"词{i}" for i in range(50)], total=0)
+    assert ok.status_code == 200, ok.text
+
+
+def test_redact_padding_ms_range(client):
+    for bad in (-1, 1001):
+        r = _redact(client, [], "", ["机密"], padding_ms=bad, total=0)
+        assert r.status_code == 422, (bad, r.text)
+        assert "0～1000" in r.json()["detail"]
+    for good in (0, 1000):
+        r = _redact(client, [], "", ["机密"], padding_ms=good, total=0)
+        assert r.status_code == 200, (good, r.text)
+
+
+def test_redact_padding_ms_wrong_type(client):
+    r = _redact(client, [], "", ["机密"], padding_ms="50", total=0)
+    assert r.status_code == 422
+    assert "整数" in r.json()["detail"]
+
+
+def test_redact_term_wrong_type(client):
+    r = _redact(client, [], "", ["机密", 1], total=0)
+    assert r.status_code == 422
+    assert "字符串" in r.json()["detail"]
+
+
+def test_redact_missing_fields_rejected(client):
+    r = client.post("/redact", json={
+        "recognized": [], "total_duration": 0, "revised_text": ""})
+    assert r.status_code == 422
+    assert "terms" in r.json()["detail"]
+    assert "padding_ms" in r.json()["detail"]
+
+
+def test_redact_extra_field_rejected(client):
+    r = client.post("/redact", json={
+        "recognized": [], "total_duration": 0, "revised_text": "",
+        "terms": ["机密"], "padding_ms": 0, "bogus": 1})
+    assert r.status_code == 422
+    assert "不允许" in r.json()["detail"]

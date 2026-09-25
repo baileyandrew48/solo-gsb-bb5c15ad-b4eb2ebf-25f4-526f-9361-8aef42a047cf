@@ -24,12 +24,15 @@ from .schemas import (
     HealthResponse,
     LocateQuoteRequest,
     QuoteHit,
+    RedactRequest,
+    RedactResponse,
     RetimeRequest,
     RevisionBlock,
     SpeakerBlock,
     SpeakerTurnsRequest,
 )
 from .quote import find_quote_hits
+from .redact import build_redaction, validate_redact
 from .retime import apply_calibrations, validate_calibrations
 from .revision import build_revision_diff
 from .speaker import build_speaker_blocks, validate_speaker_turns
@@ -78,7 +81,7 @@ async def validation_handler(_request: Request,
         if etype == "missing":
             messages.append(f"缺少必填字段：{loc}")
         elif etype in ("int_type", "int_parsing"):
-            if loc.endswith(("max_edits", "max_chars")):
+            if loc.endswith(("max_edits", "max_chars", "padding_ms")):
                 messages.append(f"字段 {loc} 必须是整数")
             elif loc.endswith(("start_index", "end_index")):
                 messages.append(f"字段 {loc} 必须是整数字符下标")
@@ -97,6 +100,8 @@ async def validation_handler(_request: Request,
                 range_hint = "，允许范围为 500～30000"
             elif loc.endswith("bucket_ms"):
                 range_hint = "，允许范围为 1000～60000"
+            elif loc.endswith("padding_ms"):
+                range_hint = "，允许范围为 0～1000"
             else:
                 range_hint = ""
             messages.append(f"字段 {loc} 无效{range_hint}")
@@ -109,6 +114,8 @@ async def validation_handler(_request: Request,
                 messages.append("每个实体的别名数量无效，允许范围为 1～5 个")
             elif loc.endswith("annotations"):
                 messages.append("批注数量无效，允许范围为 1～100 条")
+            elif loc.endswith("terms"):
+                messages.append("敏感词数量无效，允许范围为 1～50 个")
             else:
                 messages.append(f"字段 {loc} 无效")
         elif etype == "extra_forbidden":
@@ -241,3 +248,18 @@ async def annotation_migrate(
     timeline = build_timeline(req, alignment.backend_name())
     return build_annotation_migrations(
         req.old_text, req.revised_text, timeline["chars"], req.annotations)
+
+
+@app.post(
+    "/redact",
+    response_model=RedactResponse,
+    tags=["敏感词脱敏"],
+)
+async def redact(req: RedactRequest) -> RedactResponse:
+    """对修订文本做敏感词遮蔽，并给出供音频静音的毫秒区间。"""
+    validate_request(req, MAX_RECOGNIZED_CHARS, MAX_REVISED_LENGTH)
+    validate_redact(req)
+    timeline = build_timeline(req, alignment.backend_name())
+    return build_redaction(
+        req.revised_text, timeline["chars"], req.terms, req.padding_ms,
+        req.total_duration)
