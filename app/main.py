@@ -12,6 +12,7 @@ from .annotation import build_annotation_migrations, validate_annotations
 from .captions import build_captions
 from .entity_links import build_entity_links, validate_entity_links
 from .errors import InvalidTimelineError
+from .redact import build_redaction, validate_sensitive_words
 from .schemas import (
     AlignRequest,
     AlignResponse,
@@ -24,6 +25,8 @@ from .schemas import (
     HealthResponse,
     LocateQuoteRequest,
     QuoteHit,
+    RedactRequest,
+    RedactResponse,
     RetimeRequest,
     RevisionBlock,
     SpeakerBlock,
@@ -97,6 +100,8 @@ async def validation_handler(_request: Request,
                 range_hint = "，允许范围为 500～30000"
             elif loc.endswith("bucket_ms"):
                 range_hint = "，允许范围为 1000～60000"
+            elif loc.endswith("padding_ms"):
+                range_hint = "，允许范围为 0～1000"
             else:
                 range_hint = ""
             messages.append(f"字段 {loc} 无效{range_hint}")
@@ -109,6 +114,8 @@ async def validation_handler(_request: Request,
                 messages.append("每个实体的别名数量无效，允许范围为 1～5 个")
             elif loc.endswith("annotations"):
                 messages.append("批注数量无效，允许范围为 1～100 条")
+            elif loc.endswith("sensitive_words"):
+                messages.append("敏感词数量无效，允许范围为 1～50 个")
             else:
                 messages.append(f"字段 {loc} 无效")
         elif etype == "extra_forbidden":
@@ -241,3 +248,18 @@ async def annotation_migrate(
     timeline = build_timeline(req, alignment.backend_name())
     return build_annotation_migrations(
         req.old_text, req.revised_text, timeline["chars"], req.annotations)
+
+
+@app.post(
+    "/redact",
+    response_model=RedactResponse,
+    tags=["敏感词脱敏"],
+)
+async def redact(req: RedactRequest) -> RedactResponse:
+    """在修订稿中精确遮蔽敏感词，并返回扩展合并后的音频静音毫秒区间。"""
+    validate_request(req, MAX_RECOGNIZED_CHARS, MAX_REVISED_LENGTH)
+    validate_sensitive_words(req)
+    timeline = build_timeline(req, alignment.backend_name())
+    return build_redaction(
+        req.revised_text, timeline["chars"],
+        req.sensitive_words, req.padding_ms, req.total_duration)

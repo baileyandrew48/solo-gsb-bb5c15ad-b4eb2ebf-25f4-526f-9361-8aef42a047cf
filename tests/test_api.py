@@ -1706,3 +1706,274 @@ def test_annotation_migrate_index_wrong_type(client):
                          "end_index": 1}]})
     assert r.status_code == 422
     assert "整数" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# 敏感词脱敏 POST /redact
+# ---------------------------------------------------------------------------
+def _redact(client, items, revised, words, padding_ms=0, total=1000):
+    payload = {
+        "recognized": rc(items),
+        "total_duration": total,
+        "revised_text": revised,
+        "sensitive_words": words,
+        "padding_ms": padding_ms,
+    }
+    return client.post("/redact", json=payload)
+
+
+def test_redact_basic_mask_and_times(client):
+    # 你[0,100) 好[100,200) 张[200,300) 三[300,400) 呀 400..500
+    r = _redact(client, [
+        ("你", 0, 100), ("好", 100, 200), ("张", 200, 300),
+        ("三", 300, 400),
+    ], "你好张三呀", ["张三"], 0, total=500)
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "redacted_text": "你好██呀",
+        "spans": [{
+            "start_index": 2, "end_index": 4, "text": "张三",
+            "start": 200, "end": 400,
+        }],
+        "audio_ranges": [{"start": 200, "end": 400}],
+    }
+
+
+def test_redact_multiple_words_and_occurrences(client):
+    r = _redact(client, [
+        ("张", 0, 100), ("三", 100, 200), ("x", 200, 300),
+        ("李", 300, 400), ("四", 400, 500),
+    ], "张三x李四", ["张三", "李四"], 0, total=600)
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "redacted_text": "██x██",
+        "spans": [
+            {"start_index": 0, "end_index": 2, "text": "张三",
+             "start": 0, "end": 200},
+            {"start_index": 3, "end_index": 5, "text": "李四",
+             "start": 300, "end": 500},
+        ],
+        "audio_ranges": [
+            {"start": 0, "end": 200},
+            {"start": 300, "end": 500},
+        ],
+    }
+
+
+def test_redact_padding_expands_and_separate_ranges(client):
+    # 张三 [200,400)，padding 100 → [100,500)
+    r = _redact(client, [
+        ("你", 0, 100), ("好", 100, 200), ("张", 200, 300),
+        ("三", 300, 400),
+    ], "你好张三", ["张三"], 100, total=600)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["redacted_text"] == "你好██"
+    assert body["spans"] == [{
+        "start_index": 2, "end_index": 4, "text": "张三",
+        "start": 200, "end": 400}]
+    assert body["audio_ranges"] == [{"start": 100, "end": 500}]
+
+
+def test_redact_padding_clamped_to_recording_bounds(client):
+    # 张三位于录音首尾：[0,100) 与 [400,500)，padding 200 裁剪为 [0,300) 与 [200,500)
+    r = _redact(client, [
+        ("张", 0, 100), ("x", 100, 400), ("三", 400, 500),
+    ], "张x三", ["张", "三"], 200, total=500)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["redacted_text"] == "█x█"
+    assert [s["text"] for s in body["spans"]] == ["张", "三"]
+    # [0,300) 与 [200,500) 重叠 → 合并为整个录音
+    assert body["audio_ranges"] == [{"start": 0, "end": 500}]
+
+
+def test_redact_touching_text_spans_merge_but_padding_keeps_split(client):
+    # “张三”由两个单字词命中，相接 → 合并为一个字符区间
+    r = _redact(client, [
+        ("张", 0, 100), ("三", 100, 200), ("x", 200, 300),
+        ("李", 300, 400), ("四", 400, 500),
+    ], "张三x李四", ["张", "三", "李四"], 0, total=600)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["redacted_text"] == "██x██"
+    assert body["spans"] == [
+        {"start_index": 0, "end_index": 2, "text": "张三",
+         "start": 0, "end": 200},
+        {"start_index": 3, "end_index": 5, "text": "李四",
+         "start": 300, "end": 500},
+    ]
+    # padding 0：[0,200) 与 [300,500) 不重叠不相接，保持两个区间
+    assert body["audio_ranges"] == [
+        {"start": 0, "end": 200}, {"start": 300, "end": 500}]
+
+
+def test_redact_padding_merges_touching_audio_ranges(client):
+    # [0,200)+100 → [0,300)；[300,500)+100 → [200,600)，重叠合并
+    r = _redact(client, [
+        ("张", 0, 100), ("三", 100, 200), ("x", 200, 300),
+        ("李", 300, 400), ("四", 400, 500),
+    ], "张三x李四", ["张三", "李四"], 100, total=600)
+    assert r.status_code == 200, r.text
+    assert r.json()["audio_ranges"] == [{"start": 0, "end": 600}]
+
+
+def test_redact_overlapping_word_occurrences_merged(client):
+    # “aa”在“aaa”中的两次重叠出现合并为一个 3 字区间
+    r = _redact(client, [
+        ("a", 0, 100), ("a", 100, 200), ("a", 200, 300),
+    ], "aaa", ["aa"], 0, total=400)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["redacted_text"] == "███"
+    assert body["spans"] == [{
+        "start_index": 0, "end_index": 3, "text": "aaa",
+        "start": 0, "end": 300}]
+    assert body["audio_ranges"] == [{"start": 0, "end": 300}]
+
+
+def test_redact_no_hit_returns_original_and_empty_ranges(client):
+    r = _redact(client, [
+        ("你", 0, 100), ("好", 100, 200),
+    ], "你好", ["张三"], 100, total=300)
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "redacted_text": "你好",
+        "spans": [],
+        "audio_ranges": [],
+    }
+
+
+def test_redact_empty_revised_text(client):
+    r = _redact(client, [], "", ["张三"], 0, total=0)
+    assert r.status_code == 200, r.text
+    assert r.json() == {"redacted_text": "", "spans": [], "audio_ranges": []}
+
+
+def test_redact_preserves_text_length(client):
+    r = _redact(client, [
+        ("张", 0, 100), ("三", 100, 200),
+    ], "张三", ["张三"], 1000, total=200)
+    body = r.json()
+    assert len(body["redacted_text"]) == len("张三") == 2
+    assert body["redacted_text"] == "██"
+    # padding 1000 裁剪到录音边界
+    assert body["audio_ranges"] == [{"start": 0, "end": 200}]
+
+
+def test_redact_uses_computed_timeline_for_inserted_chars(client):
+    # 修订稿“张三呀李四”，“呀”为新增字符（推算 [200,300)）；
+    # 敏感词“三呀李”横跨匹配字符与新增字符。
+    r = _redact(client, [
+        ("张", 0, 100), ("三", 100, 200), ("李", 300, 400), ("四", 400, 500),
+    ], "张三呀李四", ["三呀李"], 0, total=600)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["redacted_text"] == "张███四"
+    assert body["spans"] == [{
+        "start_index": 1, "end_index": 4, "text": "三呀李",
+        "start": 100, "end": 400}]
+    assert body["audio_ranges"] == [{"start": 100, "end": 400}]
+
+
+def test_redact_zero_duration_recording(client):
+    r = _redact(client, [("张", 0, 0), ("三", 0, 0)], "张三", ["张三"], 100,
+                total=0)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["redacted_text"] == "██"
+    assert body["audio_ranges"] == [{"start": 0, "end": 0}]
+
+
+def test_redact_reuses_alignment_validation(client):
+    r = _redact(client, [("a", 300, 100)], "a", ["a"], 0, total=500)
+    assert r.status_code == 422
+    assert "结束时间" in r.json()["detail"]
+
+
+def test_redact_empty_word_list_rejected(client):
+    r = client.post("/redact", json={
+        "recognized": [], "total_duration": 0, "revised_text": "",
+        "sensitive_words": [], "padding_ms": 0})
+    assert r.status_code == 422
+    assert "1～50" in r.json()["detail"]
+
+
+def test_redact_too_many_words_rejected(client):
+    words = [f"词{i}" for i in range(51)]
+    r = client.post("/redact", json={
+        "recognized": [], "total_duration": 0, "revised_text": "",
+        "sensitive_words": words, "padding_ms": 0})
+    assert r.status_code == 422
+    assert "1～50" in r.json()["detail"]
+
+
+def test_redact_fifty_words_accepted(client):
+    words = [f"词{i}" for i in range(50)]
+    r = client.post("/redact", json={
+        "recognized": [], "total_duration": 0, "revised_text": "",
+        "sensitive_words": words, "padding_ms": 0})
+    assert r.status_code == 200, r.text
+    assert r.json() == {"redacted_text": "", "spans": [], "audio_ranges": []}
+
+
+def test_redact_empty_word_rejected(client):
+    r = client.post("/redact", json={
+        "recognized": [], "total_duration": 0, "revised_text": "",
+        "sensitive_words": ["张三", ""], "padding_ms": 0})
+    assert r.status_code == 422
+    assert "非空" in r.json()["detail"]
+
+
+def test_redact_duplicate_word_rejected(client):
+    r = client.post("/redact", json={
+        "recognized": [], "total_duration": 0, "revised_text": "",
+        "sensitive_words": ["张三", "张三"], "padding_ms": 0})
+    assert r.status_code == 422
+    assert "互不重复" in r.json()["detail"]
+
+
+def test_redact_padding_ms_range(client):
+    for bad in (-1, 1001):
+        r = client.post("/redact", json={
+            "recognized": [], "total_duration": 0, "revised_text": "",
+            "sensitive_words": ["a"], "padding_ms": bad})
+        assert r.status_code == 422, (bad, r.text)
+        assert "0～1000" in r.json()["detail"]
+    for good in (0, 1000):
+        r = client.post("/redact", json={
+            "recognized": [], "total_duration": 0, "revised_text": "",
+            "sensitive_words": ["a"], "padding_ms": good})
+        assert r.status_code == 200, (good, r.text)
+
+
+def test_redact_padding_ms_wrong_type(client):
+    r = client.post("/redact", json={
+        "recognized": [], "total_duration": 0, "revised_text": "",
+        "sensitive_words": ["a"], "padding_ms": "100"})
+    assert r.status_code == 422
+    assert "整数毫秒" in r.json()["detail"]
+
+
+def test_redact_words_wrong_type(client):
+    r = client.post("/redact", json={
+        "recognized": [], "total_duration": 0, "revised_text": "",
+        "sensitive_words": "张三", "padding_ms": 0})
+    assert r.status_code == 422
+
+
+def test_redact_missing_fields_rejected(client):
+    r = client.post("/redact", json={
+        "recognized": [], "total_duration": 0, "revised_text": ""})
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert "sensitive_words" in detail
+    assert "padding_ms" in detail
+
+
+def test_redact_extra_field_rejected(client):
+    r = client.post("/redact", json={
+        "recognized": [], "total_duration": 0, "revised_text": "",
+        "sensitive_words": ["a"], "padding_ms": 0, "bogus": 1})
+    assert r.status_code == 422
+    assert "不允许" in r.json()["detail"]

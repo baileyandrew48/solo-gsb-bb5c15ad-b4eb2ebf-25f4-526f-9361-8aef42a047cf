@@ -144,6 +144,21 @@ class AnnotationMigrateRequest(AlignRequest):
     )
 
 
+class RedactRequest(AlignRequest):
+    """校时输入与敏感词脱敏参数。"""
+
+    sensitive_words: list[
+        Annotated[str, StringConstraints(min_length=1)]
+    ] = Field(
+        ..., min_length=1, max_length=50,
+        description="敏感词列表（1～50 个）；每个非空且互不重复",
+    )
+    padding_ms: StrictInt = Field(
+        ..., ge=0, le=1000,
+        description="音频静音区间向两侧扩展的毫秒数（0～1000）",
+    )
+
+
 class RevisedCharTimeline(BaseModel):
     char: str = Field(..., description="修订文本中的字符")
     start: int = Field(..., description="起始时间（毫秒）")
@@ -265,3 +280,30 @@ class AnnotationMigration(BaseModel):
         ..., description="新稿片段首字符时间轴的 start（毫秒）；orphan 时为 null")
     end: int | None = Field(
         ..., description="新稿片段末字符时间轴的 end（毫秒）；orphan 时为 null")
+
+
+class RedactedSpan(BaseModel):
+    start_index: int = Field(
+        ..., description="合并区间在脱敏文本中的起始字符下标（从 0 开始，半开区间）")
+    end_index: int = Field(
+        ..., description="合并区间在脱敏文本中的结束字符下标（不含该位置）")
+    text: str = Field(..., description="该区间被遮蔽的原文文字")
+    start: int = Field(..., description="首字符时间轴的 start（毫秒）")
+    end: int = Field(..., description="末字符时间轴的 end（毫秒）")
+
+
+class MuteRange(BaseModel):
+    start: int = Field(..., description="静音起始时间（毫秒，含该时点）")
+    end: int = Field(..., description="静音结束时间（毫秒，不含该时点）")
+
+
+class RedactResponse(BaseModel):
+    redacted_text: str = Field(
+        ..., description="脱敏后的文本；命中字符以等长的 █ 遮蔽，长度与原文相同")
+    spans: list[RedactedSpan] = Field(
+        ..., description="合并后的敏感字符区间，按原文顺序返回；无命中时为空列表")
+    audio_ranges: list[MuteRange] = Field(
+        ...,
+        description="供音频静音处理的毫秒半开区间：各区间时间向两侧扩展 padding_ms、"
+        "裁剪到录音边界后再合并重叠或相接区间；无命中时为空列表",
+    )

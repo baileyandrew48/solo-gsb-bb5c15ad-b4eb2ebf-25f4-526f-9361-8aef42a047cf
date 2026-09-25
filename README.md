@@ -18,6 +18,7 @@
 - 支持 `POST /retime`：在 `/align` 的逐字时间轴上，按 1～20 个校准点做分段线性重映射，校正整体语速偏差。
 - 支持 `POST /entity-links`：复用校时输入与逐字时间轴，按实体别名精确命中与时间桶生成采访对象的共提及关系（边权 = 共同出现的桶数）。
 - 支持 `POST /annotation-migrate`：对旧版修订文本与新版修订稿做全局顺序对齐，按相同字符的匹配关系把旧稿批注区间迁移到新稿（complete/partial/orphan），并给出新稿片段的首末毫秒。
+- 支持 `POST /redact`：复用校时输入和逐字时间轴，在修订稿中精确查找 1～50 个敏感词，合并重叠或相接命中后用等长 █ 遮蔽，并返回扩展 padding 后的音频静音毫秒区间。
 - 提供 `/health` 健康检查。
 - 对齐内核为 **C（ctypes 调用）**，无编译器时自动回退**纯 Python** 实现，二者算法一致。
 
@@ -41,6 +42,7 @@ docker compose up --build -d
 - 说话人轮次归属接口：`POST http://localhost:8000/speaker-turns`
 - 实体共提及接口：`POST http://localhost:8000/entity-links`
 - 批注迁移接口：`POST http://localhost:8000/annotation-migrate`
+- 敏感词脱敏接口：`POST http://localhost:8000/redact`
 - 交互式文档：`http://localhost:8000/docs`（OpenAPI：`/openapi.json`）
 
 停止：
@@ -621,6 +623,86 @@ curl -X POST http://localhost:8000/annotation-migrate \
 - 示例中“吗”被替换为“呀”（替换纠错不算存活），因此 a1 只有“好”存活
   （`partial`，新区间 `[1,2)`），a3 无任何存活字符（`orphan`）。
 
+### `POST /redact`
+
+在执行与 `/align` 完全相同的输入校验和逐字校时后，在 `revised_text` 中**逐字精确
+查找**所有敏感词的出现：把**重叠或相接**的命中先合并为**半开字符区间**，用**等长的
+█** 遮蔽这些字符；再把每个区间的首末字时间向两侧扩展 `padding_ms`、裁剪到录音边界，
+合并重叠或相接的毫秒区间，供音频静音处理。
+
+请求体包含 `/align` 的全部字段，另加：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `sensitive_words` | 字符串数组 | 敏感词列表，数量 `1～50`；每个**非空**且**互不重复** |
+| `padding_ms` | 整数 | 音频静音区间向两侧扩展的毫秒数，允许 `0～1000` |
+
+处理规则：
+
+1. 对每个敏感词找出修订稿中的**全部精确出现**（含相互重叠的出现），按字符下标排序；
+2. 命中区间 `[start, end)` 只要**重叠或相接**（后一个 `start` 不大于前一个 `end`）
+   就合并为一个区间；
+3. 合并区间内的每个字符替换为一个 `█`，因此**脱敏文本与原文等长**；
+4. 每个合并区间返回其字符下标、被遮蔽的**原文**，以及首字符时间轴的 `start`、
+   末字符时间轴的 `end`；
+5. 把每个区间的时间扩展为 `[start - padding_ms, end + padding_ms)`，裁剪到
+   `[0, total_duration]`，再合并其中重叠或相接的区间，得到 `audio_ranges`；
+6. **无任何命中**时返回原文与空的 `spans`、`audio_ranges`。
+
+示例：
+
+```bash
+curl -X POST http://localhost:8000/redact \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "recognized": [
+      {"char":"我","start":0,"end":100},
+      {"char":"的","start":100,"end":200},
+      {"char":"名","start":200,"end":300},
+      {"char":"字","start":300,"end":400},
+      {"char":"叫","start":400,"end":500},
+      {"char":"张","start":500,"end":600},
+      {"char":"三","start":600,"end":700}
+    ],
+    "total_duration": 1000,
+    "revised_text": "我的名字叫张三",
+    "sensitive_words": ["名字", "张三"],
+    "padding_ms": 100
+  }'
+```
+
+响应：
+
+```json
+{
+  "redacted_text": "我的██叫██",
+  "spans": [
+    {"start_index": 2, "end_index": 4, "text": "名字", "start": 200, "end": 400},
+    {"start_index": 5, "end_index": 7, "text": "张三", "start": 500, "end": 700}
+  ],
+  "audio_ranges": [
+    {"start": 100, "end": 800}
+  ]
+}
+```
+
+字段说明：
+
+- `redacted_text`：脱敏文本，长度与 `revised_text` 相同，仅命中字符被替换为 `█`。
+- `spans`：合并后的敏感字符区间，按**原文顺序**返回。`start_index` / `end_index`
+  为半开字符下标，`text` 为该区间原文，`start` / `end` 取首字 `start` 与末字 `end`。
+  上例两个字符区间的扩展时间分别为 `[100,500)` 与 `[400,800)`，因重叠而合并为
+  单个 `audio_ranges` 区间 `[100,800)`；若 `padding_ms=0`，它们相距 100 毫秒，
+  则保持为 `{"start":200,"end":400}` 与 `{"start":500,"end":700}` 两个区间。
+- `audio_ranges`：供音频静音处理的**左闭右开**毫秒区间 `[start, end)`，已扩展
+  padding、裁剪到录音边界并完成合并；无命中时为 `[]`。
+
+无效词表示例（敏感词重复）返回 **422**：
+
+```json
+{"detail": "敏感词必须互不重复：'张三' 重复出现"}
+```
+
 ### 输入校验（HTTP 422）
 
 例如 `end < start`：
@@ -638,7 +720,8 @@ curl -X POST http://localhost:8000/annotation-migrate \
 未按起始时间排序或区间重叠、`/entity-links` 的实体数量不在 2～20、
 实体 ID 为空或重复、别名数量不在 1～5、别名为空或全局重复、
 `bucket_ms` 不在 1000～60000、`/annotation-migrate` 的批注数量不在 1～100、
-批注 ID 为空或重复、区间为空或越出旧版修订文本等。
+批注 ID 为空或重复、区间为空或越出旧版修订文本，以及 `/redact` 的敏感词数量不在
+1～50、敏感词为空或互相重复、`padding_ms` 不在 0～1000 等。
 
 ---
 
@@ -694,6 +777,7 @@ app/
   speaker.py         说话人轮次归属（按重叠时长最大 → 较早轮次）与相邻同归属合并
   entity_links.py    实体共提及（别名精确命中最优选择、时间桶归集与共现边权）
   annotation.py      批注迁移（旧新文本全局对齐、存活字符最小覆盖区间与状态判定）
+  redact.py          敏感词脱敏（精确命中合并、等长 █ 遮蔽与 padding 音频静音区间）
   alignment.py       内核加载（C → 即时编译 → 纯 Python）
   align_py.py        纯 Python 后备内核
   native/align_c.c   C 对齐内核源码
